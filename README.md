@@ -19,7 +19,8 @@ A lightweight vLLM implementation built from scratch.
 ## Installation
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+cd /path/to/nano-vllm
+python3 -m pip install -e .
 ```
 
 ## Model Download
@@ -33,7 +34,7 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 
 ## Quick Start
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
+See `python3 tests/example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
 from nanovllm import LLM, SamplingParams
 llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
@@ -45,21 +46,22 @@ outputs[0]["text"]
 
 ## Benchmark
 
-See `bench.py` for benchmark.
+See `bench/random_generate.py` for benchmark.
 
 **Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
+- Hardware: 
 - Model: Qwen3-0.6B
 - Total Requests: 256 sequences
 - Input Length: Randomly sampled between 100–1024 tokens
 - Output Length: Randomly sampled between 100–1024 tokens
+- Output Tokens: 133,966
 
 **Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
 
+| Hardware/Throughput   | vLLM(tokens/s) | nano-vLLM(tokens/s) | Output Tokens |
+|-----------------------|----------------|---------------------| ------------- |
+| RTX 4070 Laptop (8GB) | 1361.84        | 1434.13             | 133,966       |
+| H200                  | -              | 20806.44            | 1,141,585     |
 
 ## Star History
 

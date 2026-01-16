@@ -1,10 +1,11 @@
 import os
-from nanovllm import LLM, SamplingParams
+import sys
 from transformers import AutoTokenizer
+from nanovllm import LLM, SamplingParams
 
 
-def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+def main(model_path: str):
+    path = os.path.expanduser(model_path)
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
@@ -30,4 +31,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        model_path = sys.argv[1]
+    else:
+        model_path = "~/huggingface/Qwen3-0.6B/"
+    main(model_path=model_path)
