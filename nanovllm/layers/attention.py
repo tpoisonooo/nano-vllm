@@ -6,7 +6,6 @@ import triton.language as tl
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
-
 @triton.jit
 def store_kvcache_kernel(
     key_ptr,
@@ -47,7 +46,6 @@ def store_kvcache(
     store_kvcache_kernel[(N,)](
         key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D
     )
-
 
 class Attention(nn.Module):
     def __init__(

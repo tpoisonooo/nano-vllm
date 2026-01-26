@@ -5,7 +5,7 @@ from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
-from nanovllm.layers.layernorm import RMSNorm
+from nanovllm.layers.norm import RMSNorm
 from nanovllm.layers.linear import (
     QKVParallelLinear,
     MergedColumnParallelLinear,
@@ -13,7 +13,6 @@ from nanovllm.layers.linear import (
 )
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-
 
 class Qwen3Attention(nn.Module):
     def __init__(
@@ -89,7 +88,6 @@ class Qwen3Attention(nn.Module):
         output = self.o_proj(o.flatten(1, -1))
         return output
 
-
 class Qwen3MLP(nn.Module):
     def __init__(
         self,
@@ -116,7 +114,6 @@ class Qwen3MLP(nn.Module):
         x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
-
 
 class Qwen3DecoderLayer(nn.Module):
     def __init__(
@@ -160,7 +157,6 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-
 class Qwen3Model(nn.Module):
     def __init__(
         self,
@@ -186,7 +182,6 @@ class Qwen3Model(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
-
 
 class Qwen3ForCausalLM(nn.Module):
     packed_modules_mapping = {

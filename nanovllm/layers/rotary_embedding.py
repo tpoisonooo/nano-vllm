@@ -2,7 +2,6 @@ from functools import lru_cache
 import torch
 from torch import nn
 
-
 def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -12,7 +11,6 @@ def apply_rotary_emb(
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
     return torch.cat((y1, y2), dim=-1).to(x.dtype)
-
 
 class RotaryEmbedding(nn.Module):
     def __init__(
