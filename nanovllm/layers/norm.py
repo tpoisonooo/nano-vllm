@@ -1,6 +1,9 @@
 import torch
 from torch import nn
 
+import torch._dynamo
+torch._dynamo.config.recompile_limit = 256
+
 class RMSNorm(nn.Module):
     def __init__(
         self,
@@ -31,7 +34,7 @@ class RMSNorm(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
         x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
+        residual = x.to(orig_dtype).clone()
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(orig_dtype).mul_(self.weight)

@@ -2,7 +2,11 @@ import torch
 import triton
 import triton.language as tl
 from torch import nn
+import torch._dynamo
+import os
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
+torch._dynamo.config.recompile_limit = 512
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -22,7 +26,6 @@ class RMSNormResidualTorchCompile(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @torch.compile
     def forward(
         self,
         x: torch.Tensor,
@@ -30,7 +33,7 @@ class RMSNormResidualTorchCompile(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
         x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
+        residual = x.to(orig_dtype).clone()
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         x = x.to(orig_dtype).mul_(self.weight)
@@ -48,8 +51,6 @@ class RMSNormResidualTorchCompile(nn.Module):
         triton.Config(kwargs={'BLOCK_SIZE': 512, 'ROWS_PER_PROG': 2}, num_warps=4, num_ctas=1),
         triton.Config(kwargs={'BLOCK_SIZE': 1024, 'ROWS_PER_PROG': 4}, num_warps=8, num_ctas=1),
         triton.Config(kwargs={'BLOCK_SIZE': 2048, 'ROWS_PER_PROG': 4}, num_warps=8, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 4096, 'ROWS_PER_PROG': 8}, num_warps=8, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 8192, 'ROWS_PER_PROG': 8}, num_warps=8, num_ctas=1),
     ],
     key=['N', 'T'],
 )
@@ -200,15 +201,15 @@ def precision_check():
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=['N'],
-        x_vals=[512 * i for i in range(2, 64)],
+        x_names=['M'],
+        x_vals=[512 * i for i in range(64, 1024, 64)],
         line_arg='provider',
         line_vals=['triton', 'torch_compile', 'torch_native'],
         line_names=['Triton', 'Torch Compile', 'Torch Native'],
         styles=[('blue', '-'), ('green', '-'), ('red', '-')],
         ylabel='GB/s',
         plot_name='rms-norm-residual',
-        args={'M': 4096, 'dtype': torch.float16, 'mode': 'forward'},
+        args={'N': 128, 'dtype': torch.float16, 'mode': 'forward'},
     ))
 def bench_rms_norm_residual(M, N, dtype, provider, mode='forward', eps=1e-6, device=DEVICE):
     """Benchmark RMSNorm with residual implementations"""

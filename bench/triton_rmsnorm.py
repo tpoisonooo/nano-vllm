@@ -3,9 +3,12 @@ import triton
 import triton.language as tl
 from torch import nn
 import torch._dynamo
+import os
 
+torch._dynamo.config.recompile_limit = 256
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 # ============================================================================
 # Ground Truth: torch.compile version (from nanovllm/layers/norm.py)
@@ -40,15 +43,39 @@ class RMSNormTorchCompile(nn.Module):
 # Triton RMSNorm Kernel (inspired by layernorm v4)
 # ============================================================================
 
+#   方案 1：让每行由一个 warp 处理（更适合 N=128）
+
+#   @triton.jit
+#   def _rms_norm_fwd_fused_v2(
+#       X, Y, W, stride, N, T, eps,
+#       BLOCK_SIZE: tl.constexpr,
+#   ):
+#       # 每个 warp (32 threads) 处理一行
+#       row = tl.program_id(0)
+#       warp_id = tl.program_id(1)  # 每个 block 有多个 warps
+
+#       # 对于 N=128，4 warps 可以协作处理一行
+#       # 或者每个 warp 独立处理一行
+
+#   方案 2：使用更激进的向量化
+
+#   # 对于 N=128，可以用 float4 加载，一次处理 4 个元素
+#   # 128 / 4 = 32，正好一个 warp
+
+#   方案 3：减少 block 数量，增加每个 block 的工作量
+
+#   # 当前：grid = (T / ROWS_PER_PROG,)
+#   # 改进：让一个 block 处理更多行，但用更少的 blocks
+#   ROWS_PER_PROG = 64  # 或更大，取决于 occupancy
+
+
 @triton.autotune(
     configs=[
         triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 1}, num_warps=4, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 256, 'ROWS_PER_PROG': 1}, num_warps=4, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 512, 'ROWS_PER_PROG': 2}, num_warps=4, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 1024, 'ROWS_PER_PROG': 4}, num_warps=8, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 2048, 'ROWS_PER_PROG': 4}, num_warps=8, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 4096, 'ROWS_PER_PROG': 8}, num_warps=8, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 8192, 'ROWS_PER_PROG': 8}, num_warps=8, num_ctas=1),
+        triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 4}, num_warps=4, num_ctas=1),
+        triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 8}, num_warps=4, num_ctas=1),
+        triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 64}, num_warps=4, num_ctas=1),
+        triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 128}, num_warps=4, num_ctas=1),
     ],
     key=['N', 'T'],
 )
@@ -107,6 +134,7 @@ def rms_norm_triton(x, weight, eps=1e-6):
 
     grid = lambda meta: (triton.cdiv(T, meta['ROWS_PER_PROG']),)
     _rms_norm_fwd_fused[grid](x, out, weight, x.stride(0), C, T, eps)
+    # , BLOCK_SIZE=128, ROWS_PER_PROG=8, num_warps=4
     
     return out.view(T, C)
 
@@ -193,15 +221,15 @@ def precision_check():
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=['N'],
-        x_vals=[512 * i for i in range(2, 64, 8)],
+        x_names=['M'],
+        x_vals=[512 * i for i in range(64, 1024, 64)],
         line_arg='provider',
-        line_vals=['triton', 'torch_compile', 'torch_native'],
-        line_names=['Triton', 'Torch Compile', 'Torch Native'],
+        line_vals=['triton', 'torch_compile'],
+        line_names=['Triton', 'Torch Compile'],
         styles=[('blue', '-'), ('green', '-'), ('red', '-')],
         ylabel='GB/s',
         plot_name='rms-norm',
-        args={'M': 4096, 'dtype': torch.float16, 'mode': 'forward'},
+        args={'N': 128, 'dtype': torch.float16, 'mode': 'forward'},
     ))
 def bench_rms_norm(M, N, dtype, provider, mode='forward', eps=1e-6, device=DEVICE):
     """Benchmark RMSNorm implementations"""
@@ -245,7 +273,7 @@ def bench_rms_norm(M, N, dtype, provider, mode='forward', eps=1e-6, device=DEVIC
 # ============================================================================
 
 if __name__ == "__main__":
-    precision_check()
+    # precision_check()
     
     print("\nRunning benchmark...")
     bench_rms_norm.run(save_path='.', print_data=True)
