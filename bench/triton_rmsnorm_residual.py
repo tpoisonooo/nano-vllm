@@ -202,14 +202,14 @@ def precision_check():
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['M'],
-        x_vals=[512 * i for i in range(64, 1024, 64)],
+        x_vals=[1 * i for i in range(1, 8)],
         line_arg='provider',
         line_vals=['triton', 'torch_compile', 'torch_native'],
         line_names=['Triton', 'Torch Compile', 'Torch Native'],
         styles=[('blue', '-'), ('green', '-'), ('red', '-')],
         ylabel='GB/s',
         plot_name='rms-norm-residual',
-        args={'N': 128, 'dtype': torch.float16, 'mode': 'forward'},
+        args={'N': 1024, 'dtype': torch.float16, 'mode': 'forward'},
     ))
 def bench_rms_norm_residual(M, N, dtype, provider, mode='forward', eps=1e-6, device=DEVICE):
     """Benchmark RMSNorm with residual implementations"""

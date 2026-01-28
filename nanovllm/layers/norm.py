@@ -1,9 +1,6 @@
 import torch
 from torch import nn
 
-import torch._dynamo
-torch._dynamo.config.recompile_limit = 256
-
 class RMSNorm(nn.Module):
     def __init__(
         self,
