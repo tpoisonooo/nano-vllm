@@ -1,9 +1,11 @@
 import os
 import time
 import sys
+import torch
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
 # from vllm import LLM, SamplingParams
+
 
 def bench(llm: LLM) -> int:
     num_seqs = 256
@@ -20,10 +22,12 @@ def bench(llm: LLM) -> int:
         )
         for _ in range(num_seqs)
     ]
-    llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+    with torch.no_grad():
+        llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     print(total_tokens)
     return total_tokens
+
 
 def main(model_path: str):
     seed(0)

@@ -2,10 +2,6 @@
 <img width="300" src="assets/logo.png">
 </p>
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
-
 # Nano-vLLM
 
 A lightweight vLLM implementation built from scratch.
@@ -62,8 +58,8 @@ See `bench/random_generate.py` for benchmark.
 |-----------------------|----------------|---------------------| ------------- |
 | RTX 4070 Laptop (8GB) | 1361.84        | 1434.13             | 133,966       |
 | H200                  | -              | 20806.44            | 1,141,585     |
-| H800                  | -              | 17185.06            | 1,141,585     |
+| H800                  | -              | 17505.84            | 1,141,585     |
 
-## Star History
+## Acknowledgements
 
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+- [Liger-Kernel](https://github.com/linkedin/Liger-Kernel)

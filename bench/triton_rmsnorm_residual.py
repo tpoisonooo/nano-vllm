@@ -4,6 +4,7 @@ import triton.language as tl
 from torch import nn
 import torch._dynamo
 import os
+
 os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 torch._dynamo.config.recompile_limit = 512
@@ -13,6 +14,7 @@ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # ============================================================================
 # Ground Truth: torch.compile version (from nanovllm/layers/norm.py)
 # ============================================================================
+
 
 class RMSNormResidualTorchCompile(nn.Module):
     """Ground truth RMSNorm with residual using torch.compile (from nanovllm/layers/norm.py)"""
@@ -44,15 +46,26 @@ class RMSNormResidualTorchCompile(nn.Module):
 # Triton RMSNorm Residual Kernel
 # ============================================================================
 
+
 @triton.autotune(
     configs=[
-        triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 1}, num_warps=4, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 256, 'ROWS_PER_PROG': 1}, num_warps=4, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 512, 'ROWS_PER_PROG': 2}, num_warps=4, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 1024, 'ROWS_PER_PROG': 4}, num_warps=8, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 2048, 'ROWS_PER_PROG': 4}, num_warps=8, num_ctas=1),
+        triton.Config(
+            kwargs={"BLOCK_SIZE": 128, "ROWS_PER_PROG": 1}, num_warps=4, num_ctas=1
+        ),
+        triton.Config(
+            kwargs={"BLOCK_SIZE": 256, "ROWS_PER_PROG": 1}, num_warps=4, num_ctas=1
+        ),
+        triton.Config(
+            kwargs={"BLOCK_SIZE": 512, "ROWS_PER_PROG": 2}, num_warps=4, num_ctas=1
+        ),
+        triton.Config(
+            kwargs={"BLOCK_SIZE": 1024, "ROWS_PER_PROG": 4}, num_warps=8, num_ctas=1
+        ),
+        triton.Config(
+            kwargs={"BLOCK_SIZE": 2048, "ROWS_PER_PROG": 4}, num_warps=8, num_ctas=1
+        ),
     ],
-    key=['N', 'T'],
+    key=["N", "T"],
 )
 @triton.jit
 def _rms_norm_residual_fwd_fused(
@@ -70,7 +83,7 @@ def _rms_norm_residual_fwd_fused(
 ):
     """RMSNorm with residual forward kernel"""
     start_row = tl.program_id(0) * ROWS_PER_PROG
-    
+
     for row_idx in range(0, ROWS_PER_PROG):
         row = start_row + row_idx
         if row < T:
@@ -79,29 +92,31 @@ def _rms_norm_residual_fwd_fused(
             R_row = R + offset
             Y_row = Y + offset
             R_OUT_row = R_OUT + offset
-            
+
             # First pass: compute x + residual and store to residual output, compute variance
             _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
             for off in range(0, N, BLOCK_SIZE):
                 cols = off + tl.arange(0, BLOCK_SIZE)
                 mask = cols < N
-                x = tl.load(X_row + cols, mask=mask, other=0.).to(tl.float32)
-                r = tl.load(R_row + cols, mask=mask, other=0.).to(tl.float32)
+                x = tl.load(X_row + cols, mask=mask, other=0.0).to(tl.float32)
+                r = tl.load(R_row + cols, mask=mask, other=0.0).to(tl.float32)
                 x_plus_r = x + r
                 # Store x + residual to residual output (in orig_dtype)
                 tl.store(R_OUT_row + cols, x_plus_r, mask=mask)
                 _var += x_plus_r * x_plus_r
-            
+
             var = tl.sum(_var, axis=0) / N
             rstd = 1 / tl.sqrt(var + eps)
-            
+
             # Second pass: normalize & apply weight
             for off in range(0, N, BLOCK_SIZE):
                 cols = off + tl.arange(0, BLOCK_SIZE)
                 mask = cols < N
                 w = tl.load(W + cols, mask=mask)
                 # Reload x + residual from the stored values
-                x_plus_r = tl.load(R_OUT_row + cols, mask=mask, other=0.).to(tl.float32)
+                x_plus_r = tl.load(R_OUT_row + cols, mask=mask, other=0.0).to(
+                    tl.float32
+                )
                 x_normalized = x_plus_r * rstd
                 tl.store(Y_row + cols, x_normalized * w, mask=mask)
 
@@ -114,15 +129,20 @@ def rms_norm_residual_triton(x, residual, weight, eps=1e-6):
     out = torch.empty_like(x)
     residual_out = torch.empty_like(residual)
 
-    grid = lambda meta: (triton.cdiv(T, meta['ROWS_PER_PROG']),)
-    _rms_norm_residual_fwd_fused[grid](x, residual, out, residual_out, weight, x.stride(0), C, T, eps)
-    
+    def grid(meta):
+        return (triton.cdiv(T, meta["ROWS_PER_PROG"]),)
+
+    _rms_norm_residual_fwd_fused[grid](
+        x, residual, out, residual_out, weight, x.stride(0), C, T, eps
+    )
+
     return out.view(T, C), residual_out.view(T, C)
 
 
 # ============================================================================
 # RMSNorm Residual Module wrapping Triton kernel
 # ============================================================================
+
 
 class RMSNormResidualTriton(nn.Module):
     """RMSNorm with residual using Triton kernel"""
@@ -148,50 +168,51 @@ class RMSNormResidualTriton(nn.Module):
 # Precision Check
 # ============================================================================
 
+
 def precision_check():
     """验证 Triton 实现与 torch.compile 版本的精度一致性"""
     print("=" * 60)
     print("RMSNorm Residual Precision Check")
     print("=" * 60)
-    
+
     torch.manual_seed(42)
-    
+
     test_cases = [
         (1024, 512),
         (4096, 1024),
         (10240, 7680),
     ]
-    
+
     for M, N in test_cases:
         print(f"\nTesting shape: ({M}, {N})")
-        
+
         x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
         residual = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
-        
+
         rms_torch = RMSNormResidualTorchCompile(N, eps=1e-6).to(DEVICE)
         rms_triton = RMSNormResidualTriton(N, eps=1e-6).to(DEVICE)
-        
+
         rms_triton.weight.data.copy_(rms_torch.weight.data)
-        
+
         with torch.no_grad():
             output_torch, residual_torch = rms_torch(x.clone(), residual.clone())
             output_triton, residual_triton = rms_triton(x.clone(), residual.clone())
-        
+
         max_diff_out = torch.max(torch.abs(output_torch - output_triton))
         mean_diff_out = torch.mean(torch.abs(output_torch - output_triton))
         max_diff_res = torch.max(torch.abs(residual_torch - residual_triton))
         mean_diff_res = torch.mean(torch.abs(residual_torch - residual_triton))
-        
+
         print(f"  Output max difference: {max_diff_out:.2e}")
         print(f"  Output mean difference: {mean_diff_out:.2e}")
         print(f"  Residual max difference: {max_diff_res:.2e}")
         print(f"  Residual mean difference: {mean_diff_res:.2e}")
-        
+
         if max_diff_out < 1e-4 and max_diff_res < 1e-4:
             print("  ✓ PASSED")
         else:
             print("  ✗ FAILED (max_diff >= 1e-4)")
-    
+
     print("\n" + "=" * 60)
 
 
@@ -199,24 +220,28 @@ def precision_check():
 # Benchmark
 # ============================================================================
 
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=['M'],
+        x_names=["M"],
         x_vals=[1 * i for i in range(1, 8)],
-        line_arg='provider',
-        line_vals=['triton', 'torch_compile', 'torch_native'],
-        line_names=['Triton', 'Torch Compile', 'Torch Native'],
-        styles=[('blue', '-'), ('green', '-'), ('red', '-')],
-        ylabel='GB/s',
-        plot_name='rms-norm-residual',
-        args={'N': 1024, 'dtype': torch.float16, 'mode': 'forward'},
-    ))
-def bench_rms_norm_residual(M, N, dtype, provider, mode='forward', eps=1e-6, device=DEVICE):
+        line_arg="provider",
+        line_vals=["triton", "torch_compile", "torch_native"],
+        line_names=["Triton", "Torch Compile", "Torch Native"],
+        styles=[("blue", "-"), ("green", "-"), ("red", "-")],
+        ylabel="GB/s",
+        plot_name="rms-norm-residual",
+        args={"N": 1024, "dtype": torch.float16, "mode": "forward"},
+    )
+)
+def bench_rms_norm_residual(
+    M, N, dtype, provider, mode="forward", eps=1e-6, device=DEVICE
+):
     """Benchmark RMSNorm with residual implementations"""
     x_shape = (M, N)
     x = torch.randn(x_shape, dtype=dtype, device=device)
     residual = torch.randn(x_shape, dtype=dtype, device=device)
-    
+
     quantiles = [0.5, 0.2, 0.8]
 
     def y_fwd():
@@ -224,7 +249,7 @@ def bench_rms_norm_residual(M, N, dtype, provider, mode='forward', eps=1e-6, dev
             rms = RMSNormResidualTorchCompile(N, eps).to(device)
             rms.weight.data = torch.ones(N, dtype=dtype, device=device)
             return rms(x, residual)
-        
+
         elif provider == "torch_native":
             weight = torch.ones(N, dtype=dtype, device=device)
             x_float = x.float().add_(residual.float())
@@ -233,7 +258,7 @@ def bench_rms_norm_residual(M, N, dtype, provider, mode='forward', eps=1e-6, dev
             x_float.mul_(torch.rsqrt(var + eps))
             output = x_float.to(dtype) * weight
             return output, residual_out
-        
+
         elif provider == "triton":
             rms = RMSNormResidualTriton(N, eps).to(device)
             rms.weight.data = torch.ones(N, dtype=dtype, device=device)
@@ -242,10 +267,12 @@ def bench_rms_norm_residual(M, N, dtype, provider, mode='forward', eps=1e-6, dev
     # Warmup
     for _ in range(10):
         y_fwd()
-    
+
     # Benchmark: 3 * M * N for x, residual, and residual_out reads/writes
     # 4 tensors involved: x, residual, output, residual_out
-    gbps = lambda ms: 4 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+    def gbps(ms):
+        return 4 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+
     ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
 
     return gbps(ms), gbps(max_ms), gbps(min_ms)
@@ -257,6 +284,6 @@ def bench_rms_norm_residual(M, N, dtype, provider, mode='forward', eps=1e-6, dev
 
 if __name__ == "__main__":
     precision_check()
-    
+
     print("\nRunning benchmark...")
-    bench_rms_norm_residual.run(save_path='.', print_data=True)
+    bench_rms_norm_residual.run(save_path=os.path.dirname(__file__), print_data=True)

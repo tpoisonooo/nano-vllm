@@ -1,5 +1,6 @@
 import os
 import sys
+import torch
 from transformers import AutoTokenizer
 from nanovllm import LLM, SamplingParams
 from nanovllm.utils.profiler import ThreadSafeLayerProfiler
@@ -27,14 +28,15 @@ def main(model_path: str):
     profiler = ThreadSafeLayerProfiler()
     profiler.register_model(llm.model_runner.model)
 
-    outputs = llm.generate(prompts, sampling_params)
+    with torch.no_grad():
+        outputs = llm.generate(prompts, sampling_params)
 
     for prompt, output in zip(prompts, outputs):
         print("\n")
         print(f"Prompt: {prompt!r}")
         print(f"Completion: {output['text']!r}")
 
-    profiler.print_stats()
+    profiler.print_stats(levels=[4])
     profiler.remove_hooks()
 
 

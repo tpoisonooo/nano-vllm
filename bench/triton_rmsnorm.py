@@ -14,6 +14,7 @@ os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 # Ground Truth: torch.compile version (from nanovllm/layers/norm.py)
 # ============================================================================
 
+
 class RMSNormTorchCompile(nn.Module):
     """Ground truth RMSNorm using torch.compile (from nanovllm/layers/norm.py)"""
 
@@ -42,42 +43,25 @@ class RMSNormTorchCompile(nn.Module):
 # ============================================================================
 # Triton RMSNorm Kernel (inspired by layernorm v4)
 # ============================================================================
-
-#   方案 1：让每行由一个 warp 处理（更适合 N=128）
-
-#   @triton.jit
-#   def _rms_norm_fwd_fused_v2(
-#       X, Y, W, stride, N, T, eps,
-#       BLOCK_SIZE: tl.constexpr,
-#   ):
-#       # 每个 warp (32 threads) 处理一行
-#       row = tl.program_id(0)
-#       warp_id = tl.program_id(1)  # 每个 block 有多个 warps
-
-#       # 对于 N=128，4 warps 可以协作处理一行
-#       # 或者每个 warp 独立处理一行
-
-#   方案 2：使用更激进的向量化
-
-#   # 对于 N=128，可以用 float4 加载，一次处理 4 个元素
-#   # 128 / 4 = 32，正好一个 warp
-
-#   方案 3：减少 block 数量，增加每个 block 的工作量
-
-#   # 当前：grid = (T / ROWS_PER_PROG,)
-#   # 改进：让一个 block 处理更多行，但用更少的 blocks
-#   ROWS_PER_PROG = 64  # 或更大，取决于 occupancy
-
-
 @triton.autotune(
     configs=[
-        triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 1}, num_warps=4, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 4}, num_warps=4, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 8}, num_warps=4, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 64}, num_warps=4, num_ctas=1),
-        triton.Config(kwargs={'BLOCK_SIZE': 128, 'ROWS_PER_PROG': 128}, num_warps=4, num_ctas=1),
+        triton.Config(
+            kwargs={"BLOCK_SIZE": 128, "ROWS_PER_PROG": 1}, num_warps=4, num_ctas=1
+        ),
+        triton.Config(
+            kwargs={"BLOCK_SIZE": 128, "ROWS_PER_PROG": 4}, num_warps=4, num_ctas=1
+        ),
+        triton.Config(
+            kwargs={"BLOCK_SIZE": 128, "ROWS_PER_PROG": 8}, num_warps=4, num_ctas=1
+        ),
+        triton.Config(
+            kwargs={"BLOCK_SIZE": 128, "ROWS_PER_PROG": 64}, num_warps=4, num_ctas=1
+        ),
+        triton.Config(
+            kwargs={"BLOCK_SIZE": 128, "ROWS_PER_PROG": 128}, num_warps=4, num_ctas=1
+        ),
     ],
-    key=['N', 'T'],
+    key=["N", "T"],
 )
 @triton.jit
 def _rms_norm_fwd_fused(
@@ -94,7 +78,7 @@ def _rms_norm_fwd_fused(
     """RMSNorm forward kernel - 仿照 layernorm v4 的 persistent kernel 风格"""
     # 每个 program 负责 ROWS_PER_PROG 行，blockIdx 映射到起始行
     start_row = tl.program_id(0) * ROWS_PER_PROG
-    
+
     # 处理分配到的每一行
     for row_idx in range(0, ROWS_PER_PROG):
         row = start_row + row_idx
@@ -103,24 +87,24 @@ def _rms_norm_fwd_fused(
             offset = row * stride
             X_row = X + offset
             Y_row = Y + offset
-            
+
             # Compute RMS: sqrt(mean(x^2))
             _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
             for off in range(0, N, BLOCK_SIZE):
                 cols = off + tl.arange(0, BLOCK_SIZE)
                 mask = cols < N
-                x = tl.load(X_row + cols, mask=mask, other=0.).to(tl.float32)
+                x = tl.load(X_row + cols, mask=mask, other=0.0).to(tl.float32)
                 _var += x * x
-            
+
             var = tl.sum(_var, axis=0) / N
             rstd = 1 / tl.sqrt(var + eps)
-            
+
             # Normalize & apply weight
             for off in range(0, N, BLOCK_SIZE):
                 cols = off + tl.arange(0, BLOCK_SIZE)
                 mask = cols < N
                 w = tl.load(W + cols, mask=mask)
-                x = tl.load(X_row + cols, mask=mask, other=0.).to(tl.float32)
+                x = tl.load(X_row + cols, mask=mask, other=0.0).to(tl.float32)
                 # RMSNorm: x / sqrt(mean(x^2) + eps) * weight
                 x_normalized = x * rstd
                 tl.store(Y_row + cols, x_normalized * w, mask=mask)
@@ -132,16 +116,19 @@ def rms_norm_triton(x, weight, eps=1e-6):
     T, C = x.shape
     out = torch.empty_like(x)
 
-    grid = lambda meta: (triton.cdiv(T, meta['ROWS_PER_PROG']),)
+    def grid(meta):
+        return (triton.cdiv(T, meta["ROWS_PER_PROG"]),)
+
     _rms_norm_fwd_fused[grid](x, out, weight, x.stride(0), C, T, eps)
     # , BLOCK_SIZE=128, ROWS_PER_PROG=8, num_warps=4
-    
+
     return out.view(T, C)
 
 
 # ============================================================================
 # RMSNorm Module wrapping Triton kernel
 # ============================================================================
+
 
 class RMSNormTriton(nn.Module):
     """RMSNorm using Triton kernel"""
@@ -166,52 +153,53 @@ class RMSNormTriton(nn.Module):
 # Precision Check
 # ============================================================================
 
+
 def precision_check():
     """验证 Triton 实现与 torch.compile 版本的精度一致性"""
     print("=" * 60)
     print("RMSNorm Precision Check")
     print("=" * 60)
-    
+
     torch.manual_seed(42)
-    
+
     # 测试不同大小的输入
     test_cases = [
         (1024, 512),
         (4096, 1024),
         (10240, 7680),
     ]
-    
+
     for M, N in test_cases:
         print(f"\nTesting shape: ({M}, {N})")
-        
+
         # Create input
         x = torch.randn(M, N, device=DEVICE, dtype=torch.float32)
-        
+
         # Create modules
         rms_torch = RMSNormTorchCompile(N, eps=1e-6).to(DEVICE)
         rms_triton = RMSNormTriton(N, eps=1e-6).to(DEVICE)
-        
+
         # Copy same weights for fair comparison
         rms_triton.weight.data.copy_(rms_torch.weight.data)
-        
+
         # Forward pass
         with torch.no_grad():
             output_torch = rms_torch(x.clone())
             output_triton = rms_triton(x.clone())
-        
+
         # Calculate difference
         max_diff = torch.max(torch.abs(output_torch - output_triton))
         mean_diff = torch.mean(torch.abs(output_torch - output_triton))
-        
+
         print(f"  Max difference: {max_diff:.2e}")
         print(f"  Mean difference: {mean_diff:.2e}")
-        
+
         # Check if results are close
         if max_diff < 1e-4:
             print("  ✓ PASSED")
         else:
             print("  ✗ FAILED (max_diff >= 1e-4)")
-    
+
     print("\n" + "=" * 60)
 
 
@@ -219,39 +207,40 @@ def precision_check():
 # Benchmark
 # ============================================================================
 
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=['M'],
+        x_names=["M"],
         x_vals=[512 * i for i in range(64, 1024, 64)],
-        line_arg='provider',
-        line_vals=['triton', 'torch_compile'],
-        line_names=['Triton', 'Torch Compile'],
-        styles=[('blue', '-'), ('green', '-'), ('red', '-')],
-        ylabel='GB/s',
-        plot_name='rms-norm',
-        args={'N': 128, 'dtype': torch.float16, 'mode': 'forward'},
-    ))
-def bench_rms_norm(M, N, dtype, provider, mode='forward', eps=1e-6, device=DEVICE):
+        line_arg="provider",
+        line_vals=["triton", "torch_compile"],
+        line_names=["Triton", "Torch Compile"],
+        styles=[("blue", "-"), ("green", "-"), ("red", "-")],
+        ylabel="GB/s",
+        plot_name="rms-norm",
+        args={"N": 128, "dtype": torch.float16, "mode": "forward"},
+    )
+)
+def bench_rms_norm(M, N, dtype, provider, mode="forward", eps=1e-6, device=DEVICE):
     """Benchmark RMSNorm implementations"""
     # Create data
     x_shape = (M, N)
     x = torch.randn(x_shape, dtype=dtype, device=device)
-    
+
     quantiles = [0.5, 0.2, 0.8]
 
     def y_fwd():
-
         if provider == "torch_compile":
             rms = RMSNormTorchCompile(N, eps).to(device)
             rms.weight.data = torch.ones(N, dtype=dtype, device=device)
             return rms(x)
-        
+
         elif provider == "torch_native":
             # Native PyTorch implementation without compile
             weight = torch.ones(N, dtype=dtype, device=device)
             var = x.float().pow(2).mean(dim=-1, keepdim=True)
             return (x.float() * torch.rsqrt(var + eps)).to(dtype) * weight
-        
+
         elif provider == "triton":
             rms = RMSNormTriton(N, eps).to(device)
             rms.weight.data = torch.ones(N, dtype=dtype, device=device)
@@ -260,9 +249,11 @@ def bench_rms_norm(M, N, dtype, provider, mode='forward', eps=1e-6, device=DEVIC
     # Warmup
     for _ in range(10):
         y_fwd()
-    
+
     # Benchmark
-    gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+    def gbps(ms):
+        return 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+
     ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
 
     return gbps(ms), gbps(max_ms), gbps(min_ms)
@@ -274,6 +265,6 @@ def bench_rms_norm(M, N, dtype, provider, mode='forward', eps=1e-6, device=DEVIC
 
 if __name__ == "__main__":
     # precision_check()
-    
+
     print("\nRunning benchmark...")
-    bench_rms_norm.run(save_path='.', print_data=True)
+    bench_rms_norm.run(save_path=os.path.dirname(__file__), print_data=True)

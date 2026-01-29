@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+
 def divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
@@ -89,6 +90,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
+
 class QKVParallelLinear(ColumnParallelLinear):
     def __init__(
         self,
@@ -125,6 +127,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
+
 
 class RowParallelLinear(LinearBase):
     def __init__(
