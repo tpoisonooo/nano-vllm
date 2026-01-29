@@ -327,7 +327,7 @@ def layer_norm_triton_v4(x, weight, bias, eps=1e-6):
 # V5: Based on Liger kernel - single load of input data, pre-load weights/bias
 # Use calculate_settings to ensure BLOCK_SIZE >= N, so we only need to load once
 @triton.jit
-def _layer_norm_fwd_fused_v5(
+def _layer_norm_fwd_fused_liger(
     X,  # pointer to the input
     Y,  # pointer to the output
     W,  # pointer to the weights
@@ -379,7 +379,7 @@ def _layer_norm_fwd_fused_v5(
     tl.store(Y_row + cols, Y_f32.to(X_row_data.dtype), mask=mask)
 
 
-def layer_norm_triton_v5(x, weight, bias, eps=1e-6):
+def layer_norm_triton_liger(x, weight, bias, eps=1e-6):
     # Liger-style: single load of input data
     assert x.is_contiguous()
     T, C = x.shape
@@ -391,7 +391,7 @@ def layer_norm_triton_v5(x, weight, bias, eps=1e-6):
     BLOCK_SIZE, num_warps = calculate_settings(C)
 
     grid = (T,)
-    _layer_norm_fwd_fused_v5[grid](
+    _layer_norm_fwd_fused_liger[grid](
         x,
         out,
         weight,
@@ -423,7 +423,7 @@ def precision_check_all():
         ("v2", layer_norm_triton_v2),
         ("v3", layer_norm_triton_v3),
         ("v4", layer_norm_triton_v4),
-        ("v5", layer_norm_triton_v5),
+        ("liger", layer_norm_triton_liger),
     ]:
         y = x.clone()
         output_triton = v_fn(y, w, b)
@@ -440,10 +440,10 @@ print("Start bench..")
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["N"],
-        x_vals=[512 * i for i in range(2, 64)],
+        x_vals=[512 * i for i in range(2, 64, 8)],
         line_arg="provider",
-        line_vals=["v2", "v3", "v4", "v5", "torch"],
-        line_names=["v2", "v3", "v4", "v5", "Torch"],
+        line_vals=["v2", "v3", "v4", "liger", "torch"],
+        line_names=["v2", "v3", "v4", "liger", "Torch"],
         styles=[
             ("green", "-"),
             ("yellow", "-"),
@@ -468,8 +468,8 @@ def bench_layer_norm(M, N, dtype, provider, mode="backward", eps=1e-5, device=DE
     quantiles = [0.5, 0.2, 0.8]
 
     def y_fwd():
-        # if provider == "v1":
-        #     return layer_norm_triton_v1(x, weight, bias)  # noqa: F811, E704
+        if provider == "v1":
+            return layer_norm_triton_v1(x, weight, bias)  # noqa: F811, E704
 
         if provider == "torch":
             return torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
@@ -483,8 +483,8 @@ def bench_layer_norm(M, N, dtype, provider, mode="backward", eps=1e-5, device=DE
         if provider == "v4":
             return layer_norm_triton_v4(x, weight, bias)  # noqa: F811, E704
 
-        if provider == "v5":
-            return layer_norm_triton_v5(x, weight, bias)  # noqa: F811, E704
+        if provider == "liger":
+            return layer_norm_triton_liger(x, weight, bias)  # noqa: F811, E704
 
     def gbps(ms):
         return 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
