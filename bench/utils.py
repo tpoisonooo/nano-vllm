@@ -158,16 +158,18 @@ class LaunchParam:
         self.block_size = BLOCK_SIZE
         self.num_warps = num_warps
 
-    def deduce(self, n_rows: int, n_cols:int, var_count: int=1, dev: str="cuda:0", target_occupancy:float=0.9) -> LaunchParam:
+    def deduce(self, n_rows: int, n_cols:int, var_count: int=1, dev: str="cuda:0", target_occupancy:float=0.9) -> 'LaunchParam':
         # 先推断基本的 block_size 和 num_warps
-        
         device = torch.device(dev)
         properties = driver.active.utils.get_device_properties(device.index)
         NUM_SM = properties["multiprocessor_count"]
         NUM_REGS = properties["max_num_regs"]
         SIZE_SMEM = properties["max_shared_mem"]
         WARP_SIZE = properties["warpSize"]
-        MAX_SMEM_PER_BLOCK = properties['MAX_SMEM_PER_BLOCK']
+        
+        # 从 torch 获取 MAX_SMEM_PER_BLOCK
+        torch_props = torch.cuda.get_device_properties(device)
+        MAX_SMEM_PER_BLOCK = torch_props.shared_memory_per_block
         MAX_BLOCKS_PER_SM = 32
 
         self.get_block_size_and_num_warps(n_cols, WARP_SIZE)
@@ -176,15 +178,26 @@ class LaunchParam:
         # 约束: 每个 block 的寄存器使用量不能超过 NUM_REGS
 
         # 每个线程使用的寄存器数 = f(kernel复杂度)
-        # 假设每个线程使用 R 个寄存器
-        # 则: num_warps * WARP_SIZE * R <= NUM_REGS
-        R = var_count * self.block_size
+        # var_count: kernel 中同时存在的 tl.load 变量个数（程序员手动指定）
+        # 
+        # 注意: tl.load 加载的是 BLOCK_SIZE 个元素的向量，但这些元素会被
+        # 分配到 num_warps * WARP_SIZE 个线程上并行处理
+        # 所以每个线程实际处理的元素数 = BLOCK_SIZE / (num_warps * WARP_SIZE)
+        #
+        # 假设每个 float32 元素占用 1 个 32-bit 寄存器
+        elements_per_thread = self.block_size / (self.num_warps * WARP_SIZE)
+        regs_per_thread = var_count * max(1, int(elements_per_thread))
+        regs_per_block = self.num_warps * WARP_SIZE * regs_per_thread
+        
+        # 确保至少能用 1 个 block
+        regs_per_block = max(regs_per_block, NUM_REGS // MAX_BLOCKS_PER_SM)
 
-        # 精准模型
+        # num_stages 计算:
         # num_stages <= SIZE_SMEM / (BLOCK_SIZE * bytes_per_element * buffer_count)
-        # 经验值
-        # num_stages = 4 if SIZE_SMEM > 200000 else 2
-        self.num_stages = max(1, min(4, SIZE_SMEM // (self.block_size * 4 * R)))
+        # 使用经验值，但考虑寄存器压力
+        self.num_stages = 4 if SIZE_SMEM > 200000 else 2
+        if regs_per_block > NUM_REGS // 4:  # 寄存器压力大时减少 stages
+            self.num_stages = max(1, self.num_stages // 2)
 
         # 让 GPU 满载，同时减少 launch overhead
 
@@ -198,7 +211,7 @@ class LaunchParam:
         #   c) 最大 block 数限制 (通常 16 或 32)
 
         max_blocks_per_sm = min(
-            NUM_REGS // (self.num_warps * WARP_SIZE * R),
+            max(1, NUM_REGS // regs_per_block),
             SIZE_SMEM // MAX_SMEM_PER_BLOCK,
             MAX_BLOCKS_PER_SM
         )
@@ -208,5 +221,8 @@ class LaunchParam:
         self.rows_per_prog = max(1, math.ceil(n_rows / total_blocks_needed))
 
     def print(self):
-        # TODO
-        pass
+        print(f"LaunchParam:")
+        print(f"  block_size: {self.block_size}")
+        print(f"  num_warps: {self.num_warps}")
+        print(f"  num_stages: {self.num_stages}")
+        print(f"  rows_per_prog: {self.rows_per_prog}")
