@@ -37,7 +37,7 @@ def softmax_kernel_v1(input_ptr, exp_ptr, output_ptr, n_rows, n_cols, BLOCK_SIZE
     for offset in tl.range(0, n_cols, BLOCK_SIZE, num_stages=num_stages):
         cols = offset + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
-        x = tl.load(input_ptr+cols, mask=mask, other=0.0)
+        x = tl.load(input_ptr+cols, mask=mask, other=float('-inf'))
         _max = tl.maximum(x, _max)
     row_max = tl.max(_max, axis=0)
     
@@ -46,7 +46,7 @@ def softmax_kernel_v1(input_ptr, exp_ptr, output_ptr, n_rows, n_cols, BLOCK_SIZE
         cols = offset + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
 
-        x = tl.load(input_ptr + cols, mask=mask, other=0.0)
+        x = tl.load(input_ptr + cols, mask=mask, other=float('-inf'))
         _exp = tl.exp(x - row_max)
         tl.store(exp_ptr + cols, _exp, mask=mask)
         _exp_sum += _exp
@@ -55,7 +55,7 @@ def softmax_kernel_v1(input_ptr, exp_ptr, output_ptr, n_rows, n_cols, BLOCK_SIZE
     for offset in tl.range(0, n_cols, BLOCK_SIZE, num_stages=num_stages):
         cols = offset + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
-        x = tl.load(exp_ptr + cols, mask=mask, other=0.0)
+        x = tl.load(exp_ptr + cols, mask=mask, other=float('-inf'))
         result = x / exp_sum
         tl.store(output_ptr + cols, result, mask=mask)
 
@@ -66,33 +66,65 @@ def softmax_kernel_v2(input_ptr, output_ptr, n_rows, n_cols, BLOCK_SIZE: tl.cons
     input_ptr = input_ptr + row * n_cols
     output_ptr = output_ptr + row * n_cols
 
-    _cur_max = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    _exp_sum = tl.full([BLOCK_SIZE], value=1.0, dtype=tl.float32)
-    last_max = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    # Online softmax: maintain running max and sum as scalars
+    # Use 0-d tensor (scalar) by indexing with [None]
+    cur_max = tl.full((), float("-inf"), dtype=tl.float32)
+    exp_sum = tl.full((), 0.0, dtype=tl.float32)
     
-    for offset in tl.range(0, n_cols, BLOCK_SIZE):
-        cols = offset + tl.arange(0, BLOCK_SIZE)
-        mask = cols < n_cols
-        x = tl.load(input_ptr+cols, mask=mask, other=0.0)
-        _cur_max = tl.maximum(x, _cur_max)
-        _exp_sum = _exp_sum * tl.exp(last_max - _cur_max) + tl.exp(x - _cur_max)
-        last_max = _cur_max
-
-    exp_sum = tl.sum(_exp_sum, axis=-1)
-    cur_max = tl.max(_cur_max, axis=-1)
     for offset in tl.range(0, n_cols, BLOCK_SIZE, num_stages=num_stages):
         cols = offset + tl.arange(0, BLOCK_SIZE)
         mask = cols < n_cols
-        x = tl.load(input_ptr + cols, mask=mask, other=0.0)
-        result = tl.exp(x-cur_max) / exp_sum
+        x = tl.load(input_ptr+cols, mask=mask, other=float('-inf'))
+        block_max = tl.max(x, axis=0)
+        new_max = tl.maximum(block_max, cur_max)
+
+        exp_sum = exp_sum * tl.exp(cur_max - new_max) + tl.sum(tl.exp(x-new_max), axis=0)
+        cur_max = new_max
+
+    for offset in tl.range(0, n_cols, BLOCK_SIZE, num_stages=num_stages):
+        cols = offset + tl.arange(0, BLOCK_SIZE)
+        mask = cols < n_cols
+        x = tl.load(input_ptr + cols, mask=mask, other=float('-inf'))
+        result = tl.exp(x - cur_max) / exp_sum
         tl.store(output_ptr + cols, result, mask=mask)
+
+@triton.jit
+def softmax_kernel_persistant(input_ptr, output_ptr, n_rows, n_cols, BLOCK_SIZE: tl.constexpr, num_stages: tl.constexpr, ROWS_PER_PROG: tl.constexpr):
+    # starting row of the program
+    pid = tl.program_id(0)
+    row = pid * ROWS_PER_PROG
+
+    if row < n_rows:
+        input_ptr = input_ptr + row * n_cols
+        output_ptr = output_ptr + row * n_cols
+
+        # Online softmax: maintain running max and sum as scalars
+        # Use 0-d tensor (scalar) by indexing with [None]
+        cur_max = tl.full((), float("-inf"), dtype=tl.float32)
+        exp_sum = tl.full((), 0.0, dtype=tl.float32)
+        
+        for offset in tl.range(0, n_cols, BLOCK_SIZE, num_stages=num_stages):
+            cols = offset + tl.arange(0, BLOCK_SIZE)
+            mask = cols < n_cols
+            x = tl.load(input_ptr+cols, mask=mask, other=float('-inf'))
+            block_max = tl.max(x, axis=0)
+            new_max = tl.maximum(block_max, cur_max)
+
+            exp_sum = exp_sum * tl.exp(cur_max - new_max) + tl.sum(tl.exp(x-new_max), axis=0)
+            cur_max = new_max
+
+        for offset in tl.range(0, n_cols, BLOCK_SIZE, num_stages=num_stages):
+            cols = offset + tl.arange(0, BLOCK_SIZE)
+            mask = cols < n_cols
+            x = tl.load(input_ptr + cols, mask=mask, other=float('-inf'))
+            result = tl.exp(x - cur_max) / exp_sum
+            tl.store(output_ptr + cols, result, mask=mask)
 
 properties = driver.active.utils.get_device_properties(DEVICE.index)
 NUM_SM = properties["multiprocessor_count"]
 NUM_REGS = properties["max_num_regs"]
 SIZE_SMEM = properties["max_shared_mem"]
 WARP_SIZE = properties["warpSize"]
-target = triton.runtime.driver.active.get_current_target()
 
 def v1(x):
     n_rows, n_cols = x.shape
@@ -132,6 +164,39 @@ def v2(x):
     softmax_kernel_v2[(n_rows, 1, 1)](x, y, n_rows, n_cols, BLOCK_SIZE, num_stages)
     return y
 
+def persistant(x):
+    n_rows, n_cols = x.shape
+
+    # The block size of each loop iteration is the smallest power of two greater than the number of columns in `x`
+    BLOCK_SIZE = 256
+
+    # Number of software pipelining stages.
+    num_stages = 4 if SIZE_SMEM > 200000 else 2
+
+    # Allocate output
+    y = torch.empty_like(x)
+
+
+    # 计算超参
+    num_warps = 1
+    block_size = 128
+    if n_cols >= 2048:
+        block_size = 2048
+        num_warps = 4
+    elif n_cols >= 1024:
+        block_size = 1024
+        num_warps = 2
+    elif n_cols >= 512:
+        block_size = 256
+        num_warps = 1
+
+    num_stages = 4 if SIZE_SMEM > 200000 else 2
+
+    # Create a number of persistent programs.
+    # input_ptr, exp_buf, output_ptr, n_rows, n_cols, BLOCK_SIZE: tl.constexpr, num_stages: tl.constexpr
+    softmax_kernel_persistant[(n_rows, 1, 1)](x, y, n_rows, n_cols, BLOCK_SIZE, num_stages, ROWS_PER_PROG)
+    return y
+
 def precision_check_all():
     torch.manual_seed(0)
     x_shape = (1823, 781)
@@ -156,7 +221,7 @@ precision_check_all()
         x_names=['N'],  # argument names to use as an x-axis for the plot
         x_vals=[128 * i for i in range(2, 10240, 128)],  # different possible values for `x_name`
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
-        line_vals=['torch_compile', 'torch', 'v1', 'v2'],  # possible values for `line_arg``
+        line_vals=['tc', 'torch', 'v1', 'v2'],  # possible values for `line_arg``
         line_names=["tc", "torch", "v1", "v2"],  # label name for the lines
         styles=[('blue', '-'), ('green', '-'), ('red', '-'), ('yellow', '-')],  # line styles
         ylabel="GB/s",  # label name for the y-axis
@@ -173,7 +238,7 @@ def benchmark(M, N, provider):
         ms = triton.testing.do_bench(lambda: v1(x))
     if provider == 'v2':
         ms = triton.testing.do_bench(lambda: v2(x))
-    if provider == 'torch_compile':
+    if provider == 'tc':
         ms = triton.testing.do_bench(lambda: torch_compile_softmax(x))
     gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms)
