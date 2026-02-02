@@ -3,7 +3,7 @@ from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3Config
 
-from nanovllm.layers.activation import SiluAndMul
+from nanovllm.layers.activation import get_silu_and_mul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.norm import RMSNorm
 from nanovllm.layers.linear import (
@@ -109,7 +109,7 @@ class Qwen3MLP(nn.Module):
             bias=False,
         )
         assert hidden_act == "silu"
-        self.act_fn = SiluAndMul()
+        self.act_fn = get_silu_and_mul()
 
     def forward(self, x):
         # return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))

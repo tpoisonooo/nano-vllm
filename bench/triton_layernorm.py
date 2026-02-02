@@ -443,7 +443,7 @@ print("Start bench..")
         x_vals=[512 * i for i in range(2, 64, 8)],
         line_arg="provider",
         line_vals=["v2", "v3", "v4", "liger", "torch"],
-        line_names=["v2", "v3", "v4", "liger", "Torch"],
+        line_names=["v2", "v3", "v4", "liger", "torch"],
         styles=[
             ("green", "-"),
             ("yellow", "-"),
