@@ -62,8 +62,6 @@ def sdpa_kernel_v1(
     BLOCK_D: tl.constexpr,
 ):
     """
-    TODO: 实现 SDPA 的 Triton kernel
-    
     参考算法:
     1. 加载 Q, K, V 块
     2. 计算 Q @ K^T * scale
@@ -92,10 +90,10 @@ def sdpa_kernel_v1(
 
             offs_m = m * BLOCK_M + tl.arange(0, BLOCK_M)
             mask_m = offs_m < seq_len_q
+            offs_d = tl.arange(0, BLOCK_D)
 
             for n in range(0, seq_len_kv, BLOCK_N):
                 # Q 偏移计算
-                offs_d = tl.arange(0, BLOCK_D)
                 q_ptrs = q_start + offs_m[:, None] + offs_d[None, :]
 
                 # K 转置偏移
@@ -127,18 +125,39 @@ def sdpa_kernel_v1(
             
             for _ in range(0, seq_len_kv, BLOCK_N):
                 # 算 attn score
-                # TODO
                 offs_n = n * BLOCK_N + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < seq_len_kv
                 offs_attn = offs_m[:, None] + offs_n[None, :]
-                mask_attn = mask_m&mask_n
+                mask_attn = mask_m & mask_n
                 attn = tl.load(attn_start+offs_attn, mask=mask_attn, other=tl.float32('-inf'))
                 attn_score = tl.exp(attn-_max) / _exp_sum
 
                 tl.store(attn_start+offs_attn, attn_score, mask=mask_attn)
             
         # attn_score @ V
-        # TODO
+        # [seq_len_q, seq_len_kv] @ [seq_len_kv, D]
+
+        for m in range(0, seq_len_q, BLOCK_M):
+            offs_m = m * BLOCK_M + tl.arange(0, BLOCK_M)
+            mask_m = offs_m < seq_len_q
+            
+            for n in range(0, D, BLOCK_N):
+                offs_n = n * BLOCK_N + tl.arange(0, BLOCK_N)
+                attn_ptrs = attn_start + offs_m[:, None] + offs_d[None, :]
+
+                mask_n = offs_n < D
+                v_ptrs = v_start + offs_n[None, :] * v_stride + offs_d[None, :]
+
+                acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+                for _ in range(0, D, BLOCK_D):
+                    q = tl.load(attn_ptrs, mask=mask_m)
+                    k = tl.load(v_ptrs, mask=mask_n)
+                    acc += tl.dot(q, k)
+                    
+                    attn_ptrs += BLOCK_D
+                    v_ptrs += BLOCK_D * v_stride
+                
+                tl.store(out_start+offs_m[:, None] + offs_n[None, :], mask=mask_m&mask_n)
 
 
 def v1(query, key, value, attn_mask):
