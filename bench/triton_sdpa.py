@@ -5,7 +5,7 @@ import triton.language as tl
 from triton.runtime import driver
 import math
 from utils import LaunchParam
-
+import pdb
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -29,7 +29,6 @@ def torch_compile_sdpa(query, key, value, attn_mask) -> torch.Tensor:
 
 def torch_native_sdpa(query, key, value, attn_mask) -> torch.Tensor:
     """PyTorch SDPA 原生实现 (无 torch.compile)"""
-    import pdb; pdb.set_trace()
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1))
     attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
@@ -77,7 +76,7 @@ def sdpa_kernel_v1(
         k_start = key_ptr + bid * seq_len_kv * k_stride
         v_start = value_ptr + bid * seq_len_kv * v_stride
         attn_start = attn_ptr + bid * seq_len_q * seq_len_kv
-        out_start = output_ptr + bid * seq_len_kv, v_stride
+        out_start = output_ptr + bid * seq_len_kv * v_stride
 
         # target 算 softmax buf
         # ----- | ---- |
@@ -94,45 +93,55 @@ def sdpa_kernel_v1(
 
             for n in range(0, seq_len_kv, BLOCK_N):
                 # Q 偏移计算
-                q_ptrs = q_start + offs_m[:, None] + offs_d[None, :]
+                q_ptrs = q_start + offs_m[:,None] * q_stride + offs_d[None, :]
 
                 # K 转置偏移
                 offs_n = n * BLOCK_N + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < seq_len_kv
-                k_ptrs = k_start + offs_n[None, :] * k_stride + offs_d[None, :]
+                k_ptrs = k_start + offs_d[:,None] * k_stride + offs_n[None, :]
 
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
                 for _ in range(0, D, BLOCK_D):
-                    q = tl.load(q_ptrs, mask=mask_m)
-                    k = tl.load(k_ptrs, mask=mask_n)
+                    q = tl.load(q_ptrs, mask=mask_m[:,None], other=float('-inf'))
+                    k = tl.load(k_ptrs, mask=mask_n[None,:], other=float('-inf'))
                     acc += tl.dot(q, k)
                     
                     q_ptrs += BLOCK_D
                     k_ptrs += BLOCK_D * k_stride
 
-                acc = acc * scale_factor
-                offs_attn = offs_m[:, None] + offs_n[None, :]
+                offs_attn = offs_m[:,None]*attn_stride + offs_n[None,:]
 
-                attn_fuse_mask = tl.load(mask_ptr+ offs_attn, mask=mask_m&mask_n, other=False)
-                # acc 是 softmax 输入的 [M, N] 一小块。考虑外部输入的 mask，一起跑 online-softmax
-                tl.store(attn_start+offs_attn, acc, mask=attn_fuse_mask, other=tl.float32('-inf'))
+                attn_fuse_mask = tl.load(mask_ptr+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
 
-                block_mask = tl.max(acc, mask=attn_fuse_mask, axis=-1)
-                new_max = tl.maxisum(_max, block_mask)
-                _exp_sum = _exp_sum * tl.exp(_max - new_max) + tl.exp(acc - new_max, mask=attn_fuse_mask) 
-                _max = new_max
-            
-            for _ in range(0, seq_len_kv, BLOCK_N):
+                has_true = tl.sum(attn_fuse_mask) > 0
+                if has_true:
+                    # acc 是 softmax 输入的 [M, N] 一小块。考虑外部输入的 mask，一起跑 online-softmax
+                    acc = tl.where(attn_fuse_mask, acc, float('-inf')) * scale_factor
+
+                    tl.store(attn_start+offs_attn, acc)
+                    
+                    block_max = tl.max(acc, axis=-1)
+                    new_max = tl.maximum(_max, block_max)
+                    _exp_sum = _exp_sum * tl.exp(_max - new_max) + tl.sum(tl.exp(acc - new_max), axis=-1) 
+                    _max = new_max
+
+            for n in range(0, seq_len_kv, BLOCK_N):
                 # 算 attn score
                 offs_n = n * BLOCK_N + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < seq_len_kv
-                offs_attn = offs_m[:, None] + offs_n[None, :]
-                mask_attn = mask_m & mask_n
-                attn = tl.load(attn_start+offs_attn, mask=mask_attn, other=tl.float32('-inf'))
-                attn_score = tl.exp(attn-_max) / _exp_sum
+                offs_attn = offs_m[:,None]*attn_stride + offs_n[None, :]
 
-                tl.store(attn_start+offs_attn, attn_score, mask=mask_attn)
+                attn_fuse_mask = tl.load(mask_ptr+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
+
+                has_true = tl.sum(attn_fuse_mask) > 0
+                if has_true:
+                    attn = tl.load(attn_start+offs_attn, mask=attn_fuse_mask, other=float('-inf'))
+                    attn_score = tl.exp(attn-_max) / _exp_sum
+
+                    tl.store(attn_start+offs_attn, attn_score)
+                    
+        pdb.set_trace()
             
         # attn_score @ V
         # [seq_len_q, seq_len_kv] @ [seq_len_kv, D]
@@ -143,13 +152,13 @@ def sdpa_kernel_v1(
             
             for n in range(0, D, BLOCK_N):
                 offs_n = n * BLOCK_N + tl.arange(0, BLOCK_N)
-                attn_ptrs = attn_start + offs_m[:, None] + offs_d[None, :]
+                attn_ptrs = attn_start + offs_m[:,None]*attn_stride + offs_d[None, :]
 
                 mask_n = offs_n < D
-                v_ptrs = v_start + offs_n[None, :] * v_stride + offs_d[None, :]
+                v_ptrs = v_start + offs_d[None,:]*v_stride + offs_n[None, :]
 
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-                for _ in range(0, D, BLOCK_D):
+                for _ in range(0, seq_len_kv, BLOCK_D):
                     q = tl.load(attn_ptrs, mask=mask_m)
                     k = tl.load(v_ptrs, mask=mask_n)
                     acc += tl.dot(q, k)
@@ -157,7 +166,7 @@ def sdpa_kernel_v1(
                     attn_ptrs += BLOCK_D
                     v_ptrs += BLOCK_D * v_stride
                 
-                tl.store(out_start+offs_m[:, None] + offs_n[None, :], mask=mask_m&mask_n)
+                tl.store(out_start+offs_m[:, None]*out_stride + offs_n[None, :], acc, mask=mask_m[:,None]&mask_n[None,:])
 
 
 def v1(query, key, value, attn_mask):
@@ -175,17 +184,59 @@ def v1(query, key, value, attn_mask):
     batch_size, num_heads_q, seq_len_q, head_dim = query.shape
     _, num_heads_kv, seq_len_kv, _ = key.shape
     
+    # 确保是 contiguous 的
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    
     # 默认 scale
     scale = 1.0 / math.sqrt(head_dim)
     
-    # 分配输出
-    output = torch.empty_like(query)
+    # 分配输出 (合并 batch 和 num_heads 维度以便处理)
+    # 将 (B, H, L, D) reshape 为 (B*H, L, D)
+    query_reshaped = query.view(batch_size * num_heads_q, seq_len_q, head_dim)
+    key_reshaped = key.view(batch_size * num_heads_kv, seq_len_kv, head_dim)
+    value_reshaped = value.view(batch_size * num_heads_kv, seq_len_kv, head_dim)
     
-    # TODO: 启动 kernel
-    # sdpa_kernel_v1[grid](...)
+    output = torch.empty_like(query_reshaped)
     
-    raise NotImplementedError("SDPA v1 kernel not implemented yet")
+    # 分配 attention score buffer [B*H, seq_len_q, seq_len_kv]
+    attn_buffer = torch.zeros(batch_size * num_heads_q, seq_len_q, seq_len_kv, 
+                               device=query.device, dtype=torch.float32)
     
+    # 计算 strides (在 reshape 后的 3D tensor 上)
+    q_stride = query_reshaped.stride(1)  # seq_len_q * head_dim
+    k_stride = key_reshaped.stride(1)    # seq_len_kv * head_dim  
+    v_stride = value_reshaped.stride(1)  # seq_len_kv * head_dim
+    attn_stride = attn_buffer.stride(1)  # seq_len_kv
+    out_stride = output.stride(1)        # head_dim
+    
+    # 启动 kernel: 每个 batch*head 用一个 block
+    B = batch_size * num_heads_q
+    grid = (B,)
+    
+    # 配置 block size
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_D = 64
+    
+    sdpa_kernel_v1[grid](
+        query_reshaped, key_reshaped, value_reshaped, attn_mask, output,
+        attn_buffer,
+        B, seq_len_q, seq_len_kv, head_dim,
+        scale,
+        q_stride,
+        k_stride,
+        v_stride,
+        attn_stride,
+        out_stride,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+    )
+    
+    # reshape 回 4D
+    output = output.view(batch_size, num_heads_q, seq_len_q, head_dim)
     return output
 
 
@@ -200,18 +251,18 @@ def precision_check_all():
     # 测试参数
     batch_size = 2
     num_heads = 8
-    seq_len = 512
+    q_seq_len = 256
+    kv_seq_len = 512
     head_dim = 64
     
     # 生成测试输入
-    query = torch.randn(batch_size, num_heads, seq_len, head_dim, device=DEVICE, dtype=torch.float32)
-    key = torch.randn(batch_size, num_heads, seq_len, head_dim, device=DEVICE, dtype=torch.float32)
-    value = torch.randn(batch_size, num_heads, seq_len, head_dim, device=DEVICE, dtype=torch.float32)
+    query = torch.randn(batch_size, num_heads, q_seq_len, head_dim, device=DEVICE, dtype=torch.float32)
+    key = torch.randn(batch_size, num_heads, kv_seq_len, head_dim, device=DEVICE, dtype=torch.float32)
+    value = torch.randn(batch_size, num_heads, kv_seq_len, head_dim, device=DEVICE, dtype=torch.float32)
     
     # 定义测试场景: (attn_mask, desc)
     test_cases = [
-        # (torch.ones(seq_len, seq_len, device=DEVICE, dtype=torch.bool), "bool mask (all True)"),
-        (torch.ones(seq_len, seq_len, device=DEVICE, dtype=torch.bool).tril(diagonal=0), "bool mask (causal)"),
+        (torch.ones(q_seq_len, kv_seq_len, device=DEVICE, dtype=torch.bool).tril(diagonal=0), "bool mask (causal)"),
     ]
     
     for attn_mask, desc in test_cases:
@@ -224,10 +275,10 @@ def precision_check_all():
         except Exception as e:
             print(f"  PyTorch native error: {e}")
             continue
-        
+
         # 测试各个版本
         for v_name, v_fn in [
-            ("torch_compile", torch_compile_sdpa),
+            # ("torch_compile", torch_native_sdpa),
             ("v1", v1),
         ]:
             try:
@@ -301,4 +352,4 @@ if __name__ == "__main__":
     precision_check_all()
     
     print("\nRunning benchmark...")
-    benchmark.run(save_path=os.path.dirname(__file__), print_data=True)
+    # benchmark.run(save_path=os.path.dirname(__file__), print_data=True)
