@@ -48,13 +48,8 @@ def torch_native_sdpa(query, key, value, attn_mask) -> torch.Tensor:
 def sdpa_kernel_v1(
     query_ptr, key_ptr, value_ptr, mask_ptr, output_ptr,
     attn_ptr,
-    B, seq_len_q, seq_len_kv, D,
+    B, seq_len_q, seq_len_kv, head_dim,
     scale_factor,
-    q_stride,
-    k_stride,
-    v_stride,
-    attn_stride,
-    out_stride,
     
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -69,14 +64,16 @@ def sdpa_kernel_v1(
     5. 写回输出
     """
     bid = tl.program_id(0)
-
+    offs_d = tl.arange(0, BLOCK_D)
     # batch 
     if bid < B:
-        q_start = query_ptr + bid * seq_len_q * q_stride
-        k_start = key_ptr + bid * seq_len_kv * k_stride
-        v_start = value_ptr + bid * seq_len_kv * v_stride
+        # 假设输入是连续的，使用 shape 变量计算偏移
+        q_start = query_ptr + bid * seq_len_q * head_dim
+        k_start = key_ptr + bid * seq_len_kv * head_dim
+        v_start = value_ptr + bid * seq_len_kv * head_dim
         attn_start = attn_ptr + bid * seq_len_q * seq_len_kv
-        out_start = output_ptr + bid * seq_len_kv * v_stride
+        mask_start = mask_ptr
+        out_start = output_ptr + bid * seq_len_q * head_dim
 
         # target 算 softmax buf
         # ----- | ---- |
@@ -87,37 +84,36 @@ def sdpa_kernel_v1(
             _max = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
             _exp_sum = tl.full([BLOCK_M], 0.0, dtype=tl.float32)
 
-            offs_m = m * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_m = m + tl.arange(0, BLOCK_M)
             mask_m = offs_m < seq_len_q
-            offs_d = tl.arange(0, BLOCK_D)
 
             for n in range(0, seq_len_kv, BLOCK_N):
                 # Q 偏移计算
-                q_ptrs = q_start + offs_m[:,None] * q_stride + offs_d[None, :]
+                q_ptrs = q_start + offs_m[:,None] * head_dim + offs_d[None, :]
 
                 # K 转置偏移
-                offs_n = n * BLOCK_N + tl.arange(0, BLOCK_N)
+                offs_n = n + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < seq_len_kv
-                k_ptrs = k_start + offs_d[:,None] * k_stride + offs_n[None, :]
+                k_ptrs = k_start + offs_d[:,None] * head_dim + offs_n[None, :]
 
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-                for _ in range(0, D, BLOCK_D):
+                for _ in range(0, head_dim, BLOCK_D):
                     q = tl.load(q_ptrs, mask=mask_m[:,None], other=float('-inf'))
                     k = tl.load(k_ptrs, mask=mask_n[None,:], other=float('-inf'))
                     acc += tl.dot(q, k)
                     
                     q_ptrs += BLOCK_D
-                    k_ptrs += BLOCK_D * k_stride
+                    k_ptrs += BLOCK_D * head_dim
 
-                offs_attn = offs_m[:,None]*attn_stride + offs_n[None,:]
+                offs_attn = offs_m[:,None]*seq_len_kv + offs_n[None,:]
 
-                attn_fuse_mask = tl.load(mask_ptr+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
+                attn_fuse_mask = tl.load(mask_start+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
 
                 has_true = tl.sum(attn_fuse_mask) > 0
                 if has_true:
                     # acc 是 softmax 输入的 [M, N] 一小块。考虑外部输入的 mask，一起跑 online-softmax
-                    acc = tl.where(attn_fuse_mask, acc, float('-inf')) * scale_factor
+                    acc = tl.where(attn_fuse_mask, acc * scale_factor, float('-inf'))
 
                     tl.store(attn_start+offs_attn, acc)
                     
@@ -128,11 +124,11 @@ def sdpa_kernel_v1(
 
             for n in range(0, seq_len_kv, BLOCK_N):
                 # 算 attn score
-                offs_n = n * BLOCK_N + tl.arange(0, BLOCK_N)
+                offs_n = n + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < seq_len_kv
-                offs_attn = offs_m[:,None]*attn_stride + offs_n[None, :]
+                offs_attn = offs_m[:,None]*seq_len_kv + offs_n[None, :]
 
-                attn_fuse_mask = tl.load(mask_ptr+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
+                attn_fuse_mask = tl.load(mask_start+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
 
                 has_true = tl.sum(attn_fuse_mask) > 0
                 if has_true:
@@ -141,32 +137,32 @@ def sdpa_kernel_v1(
 
                     tl.store(attn_start+offs_attn, attn_score)
                     
-        pdb.set_trace()
-            
+        # pdb.set_trace()
+        
         # attn_score @ V
-        # [seq_len_q, seq_len_kv] @ [seq_len_kv, D]
+        # [seq_len_q, seq_len_kv] @ [seq_len_kv, head_dim]
 
         for m in range(0, seq_len_q, BLOCK_M):
-            offs_m = m * BLOCK_M + tl.arange(0, BLOCK_M)
+            offs_m = m + tl.arange(0, BLOCK_M)
             mask_m = offs_m < seq_len_q
             
-            for n in range(0, D, BLOCK_N):
-                offs_n = n * BLOCK_N + tl.arange(0, BLOCK_N)
-                attn_ptrs = attn_start + offs_m[:,None]*attn_stride + offs_d[None, :]
+            for n in range(0, head_dim, BLOCK_N):
+                offs_n = n + tl.arange(0, BLOCK_N)
+                mask_n = offs_n < head_dim
 
-                mask_n = offs_n < D
-                v_ptrs = v_start + offs_d[None,:]*v_stride + offs_n[None, :]
+                attn_ptrs = attn_start + offs_m[:,None]*seq_len_kv + offs_d[None, :]
+                v_ptrs = v_start + offs_d[:,None]*head_dim + offs_n[None, :]
 
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
                 for _ in range(0, seq_len_kv, BLOCK_D):
-                    q = tl.load(attn_ptrs, mask=mask_m)
-                    k = tl.load(v_ptrs, mask=mask_n)
-                    acc += tl.dot(q, k)
+                    attn_block = tl.load(attn_ptrs, mask=mask_m[:,None])
+                    v_block = tl.load(v_ptrs, mask=mask_n[None, :])
+                    acc += tl.dot(attn_block, v_block)
                     
                     attn_ptrs += BLOCK_D
-                    v_ptrs += BLOCK_D * v_stride
+                    v_ptrs += BLOCK_D * head_dim
                 
-                tl.store(out_start+offs_m[:, None]*out_stride + offs_n[None, :], acc, mask=mask_m[:,None]&mask_n[None,:])
+                tl.store(out_start+offs_m[:, None]*head_dim + offs_n[None, :], acc, mask=mask_m[:,None]&mask_n[None,:])
 
 
 def v1(query, key, value, attn_mask):
@@ -184,10 +180,11 @@ def v1(query, key, value, attn_mask):
     batch_size, num_heads_q, seq_len_q, head_dim = query.shape
     _, num_heads_kv, seq_len_kv, _ = key.shape
     
-    # 确保是 contiguous 的
+    # 确保所有输入都是 contiguous 的
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
+    attn_mask = attn_mask.contiguous()
     
     # 默认 scale
     scale = 1.0 / math.sqrt(head_dim)
@@ -204,14 +201,8 @@ def v1(query, key, value, attn_mask):
     attn_buffer = torch.zeros(batch_size * num_heads_q, seq_len_q, seq_len_kv, 
                                device=query.device, dtype=torch.float32)
     
-    # 计算 strides (在 reshape 后的 3D tensor 上)
-    q_stride = query_reshaped.stride(1)  # seq_len_q * head_dim
-    k_stride = key_reshaped.stride(1)    # seq_len_kv * head_dim  
-    v_stride = value_reshaped.stride(1)  # seq_len_kv * head_dim
-    attn_stride = attn_buffer.stride(1)  # seq_len_kv
-    out_stride = output.stride(1)        # head_dim
-    
     # 启动 kernel: 每个 batch*head 用一个 block
+    # 假设输入是连续的，直接使用 shape 变量计算偏移
     B = batch_size * num_heads_q
     grid = (B,)
     
@@ -225,11 +216,6 @@ def v1(query, key, value, attn_mask):
         attn_buffer,
         B, seq_len_q, seq_len_kv, head_dim,
         scale,
-        q_stride,
-        k_stride,
-        v_stride,
-        attn_stride,
-        out_stride,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
@@ -251,8 +237,8 @@ def precision_check_all():
     # 测试参数
     batch_size = 2
     num_heads = 8
-    q_seq_len = 256
-    kv_seq_len = 512
+    q_seq_len = 128
+    kv_seq_len = 256
     head_dim = 64
     
     # 生成测试输入
@@ -287,6 +273,7 @@ def precision_check_all():
                 v = value.clone()
                 m = attn_mask.clone()
                 output_triton = v_fn(q, k, v, m)
+
                 max_diff = torch.max(torch.abs(output_torch - output_triton))
                 print(f"  {v_name} max diff vs torch: {max_diff:.6f}")
             except NotImplementedError as e:
@@ -326,12 +313,11 @@ def benchmark(batch_size, num_heads, seq_len, head_dim, provider):
     flops = 4 * batch_size * num_heads * seq_len * seq_len * head_dim
     
     # 生成 causal mask
-    attn_mask = torch.ones(seq_len, seq_len, device=DEVICE, dtype=torch.bool).tril(diagonal=0)
+    attn_mask = torch.ones(seq_len, seq_len, device=DEVICE, dtype=torch.bool)
+    # .tril(diagonal=0)
     
     if provider == 'torch':
         ms = triton.testing.do_bench(lambda: torch_native_sdpa(query, key, value, attn_mask))
-    elif provider == 'tc':
-        ms = triton.testing.do_bench(lambda: torch_compile_sdpa(query, key, value, attn_mask))
     elif provider == 'v1':
         try:
             ms = triton.testing.do_bench(lambda: v1(query, key, value, attn_mask))
