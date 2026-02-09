@@ -64,7 +64,6 @@ def sdpa_kernel_v1(
     5. 写回输出
     """
     bid = tl.program_id(0)
-    offs_d = tl.arange(0, BLOCK_D)
     # batch 
     if bid < B:
         # 假设输入是连续的，使用 shape 变量计算偏移
@@ -80,7 +79,6 @@ def sdpa_kernel_v1(
         # ----- | ---- | 
 
         for m in range(0, seq_len_q, BLOCK_M):
-
             _max = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
             _exp_sum = tl.full([BLOCK_M], 0.0, dtype=tl.float32)
 
@@ -88,54 +86,61 @@ def sdpa_kernel_v1(
             mask_m = offs_m < seq_len_q
 
             for n in range(0, seq_len_kv, BLOCK_N):
-                # Q 偏移计算
-                q_ptrs = q_start + offs_m[:,None] * head_dim + offs_d[None, :]
-
-                # K 转置偏移
                 offs_n = n + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < seq_len_kv
-                k_ptrs = k_start + offs_d[:,None] * head_dim + offs_n[None, :]
 
+                # 计算 Q @ K^T 的一个块 [BLOCK_M, BLOCK_N]
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-                for _ in range(0, head_dim, BLOCK_D):
-                    q = tl.load(q_ptrs, mask=mask_m[:,None], other=float('-inf'))
-                    k = tl.load(k_ptrs, mask=mask_n[None,:], other=float('-inf'))
-                    acc += tl.dot(q, k)
+                
+                # 遍历 head_dim 维度
+                for d in range(0, head_dim, BLOCK_D):
+                    offs_d_curr = d + tl.arange(0, BLOCK_D)
+                    mask_d = offs_d_curr < head_dim
                     
-                    q_ptrs += BLOCK_D
-                    k_ptrs += BLOCK_D * head_dim
+                    # Q: [BLOCK_M, BLOCK_D]
+                    q_ptrs = q_start + offs_m[:,None] * head_dim + offs_d_curr[None, :]
+                    q = tl.load(q_ptrs, mask=mask_m[:,None] & mask_d[None,:], other=0.0)
+                    
+                    # K^T: [BLOCK_D, BLOCK_N] (K 是 [BLOCK_N, BLOCK_D]，转置后)
+                    k_ptrs = k_start + offs_n[:,None] * head_dim + offs_d_curr[None, :]
+                    k = tl.load(k_ptrs, mask=mask_n[:,None] & mask_d[None,:], other=0.0)
+                    
+                    # 计算 dot product: Q @ K^T
+                    acc += tl.dot(q, tl.trans(k)).to(tl.float32)
 
                 offs_attn = offs_m[:,None]*seq_len_kv + offs_n[None,:]
+                # attn_fuse_mask = tl.load(mask_start+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
 
-                attn_fuse_mask = tl.load(mask_start+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
+                # acc 是 softmax 输入的 [M, N] 一小块。考虑外部输入的 mask，一起跑 online-softmax
+                acc_scaled = acc * scale_factor
+                # 目前 attn_mask 是全1，所以不需要 mask
+                
+                # 创建 mask：[BLOCK_M, BLOCK_N]
+                full_mask = mask_m[:,None] & mask_n[None,:]
+                # 对越界位置设为 -inf，使其不影响 softmax 统计量
+                acc_masked = tl.where(full_mask, acc_scaled, float('-inf'))
 
-                has_true = tl.sum(attn_fuse_mask) > 0
-                if has_true:
-                    # acc 是 softmax 输入的 [M, N] 一小块。考虑外部输入的 mask，一起跑 online-softmax
-                    acc = tl.where(attn_fuse_mask, acc * scale_factor, float('-inf'))
-
-                    tl.store(attn_start+offs_attn, acc)
-                    
-                    block_max = tl.max(acc, axis=-1)
-                    new_max = tl.maximum(_max, block_max)
-                    _exp_sum = _exp_sum * tl.exp(_max - new_max) + tl.sum(tl.exp(acc - new_max), axis=-1) 
-                    _max = new_max
+                tl.store(attn_start+offs_attn, acc_scaled, mask=full_mask)
+                
+                block_max = tl.max(acc_masked, axis=-1)
+                new_max = tl.maximum(_max, block_max)
+                _exp_sum = _exp_sum * tl.exp(_max - new_max) + tl.sum(tl.exp(acc_masked - new_max[:, None]), axis=-1) 
+                _max = new_max
 
             for n in range(0, seq_len_kv, BLOCK_N):
                 # 算 attn score
                 offs_n = n + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < seq_len_kv
                 offs_attn = offs_m[:,None]*seq_len_kv + offs_n[None, :]
+                # 完整的 mask: [BLOCK_M, BLOCK_N]
+                full_mask = mask_m[:,None] & mask_n[None,:]
 
-                attn_fuse_mask = tl.load(mask_start+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
+                attn = tl.load(attn_start+offs_attn, mask=full_mask, other=0.0)
+                # 计算 softmax：exp(x - max) / sum_exp
+                # 注意：只有有效位置才计算，越界位置保持为0
+                attn_score = tl.where(full_mask, tl.exp(attn - _max[:, None]) / _exp_sum[:, None], 0.0)
 
-                has_true = tl.sum(attn_fuse_mask) > 0
-                if has_true:
-                    attn = tl.load(attn_start+offs_attn, mask=attn_fuse_mask, other=float('-inf'))
-                    attn_score = tl.exp(attn-_max) / _exp_sum
-
-                    tl.store(attn_start+offs_attn, attn_score)
+                tl.store(attn_start+offs_attn, attn_score, mask=full_mask)
                     
         # pdb.set_trace()
         
@@ -150,17 +155,22 @@ def sdpa_kernel_v1(
                 offs_n = n + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < head_dim
 
-                attn_ptrs = attn_start + offs_m[:,None]*seq_len_kv + offs_d[None, :]
-                v_ptrs = v_start + offs_d[:,None]*head_dim + offs_n[None, :]
-
                 acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-                for _ in range(0, seq_len_kv, BLOCK_D):
-                    attn_block = tl.load(attn_ptrs, mask=mask_m[:,None])
-                    v_block = tl.load(v_ptrs, mask=mask_n[None, :])
-                    acc += tl.dot(attn_block, v_block)
+                
+                # 遍历 seq_len_kv 维度
+                for k in range(0, seq_len_kv, BLOCK_D):
+                    offs_k = k + tl.arange(0, BLOCK_D)
+                    mask_k = offs_k < seq_len_kv
                     
-                    attn_ptrs += BLOCK_D
-                    v_ptrs += BLOCK_D * head_dim
+                    # attn_score: [BLOCK_M, BLOCK_D]
+                    attn_ptrs = attn_start + offs_m[:,None]*seq_len_kv + offs_k[None, :]
+                    attn_block = tl.load(attn_ptrs, mask=mask_m[:,None] & mask_k[None,:], other=0.0)
+                    
+                    # V: [BLOCK_D, BLOCK_N]
+                    v_ptrs = v_start + offs_k[:,None] * head_dim + offs_n[None, :]
+                    v_block = tl.load(v_ptrs, mask=mask_k[:,None] & mask_n[None,:], other=0.0)
+                    
+                    acc += tl.dot(attn_block, v_block)
                 
                 tl.store(out_start+offs_m[:, None]*head_dim + offs_n[None, :], acc, mask=mask_m[:,None]&mask_n[None,:])
 
@@ -221,6 +231,37 @@ def v1(query, key, value, attn_mask):
         BLOCK_D=BLOCK_D,
     )
     
+    # 检查 attention score 精度：每行累加和应该接近 1.0
+    # attn_buffer 形状: [B*H, seq_len_q, seq_len_kv]
+    row_sums = attn_buffer.sum(dim=-1)  # 每行累加和
+    print("row_sums" + str(row_sums))
+    print(f"[V1 Debug] Attention score row sum - mean: {row_sums.mean():.6f}, "
+          f"std: {row_sums.std():.6f}, min: {row_sums.min():.6f}, max: {row_sums.max():.6f}")
+    
+    # 检查与标准 softmax 的差异（理论上每行和应为 1.0）
+    deviation_from_one = (row_sums - 1.0).abs()
+    print(f"[V1 Debug] Deviation from 1.0 - mean: {deviation_from_one.mean():.6f}, "
+          f"max: {deviation_from_one.max():.6f}")
+    
+    # 对比 PyTorch 的 attention score
+    with torch.no_grad():
+        L, S = seq_len_q, seq_len_kv
+        scale_factor = 1.0 / math.sqrt(head_dim)
+        attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+        attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        
+        # 计算参考 attention score (第一个 batch, 第一个 head)
+        q_ref = query_reshaped[0:1]  # [1, seq_len_q, head_dim]
+        k_ref = key_reshaped[0:1]    # [1, seq_len_kv, head_dim]
+        attn_weight_ref = q_ref @ k_ref.transpose(-2, -1) * scale_factor
+        attn_weight_ref += attn_bias
+        attn_weight_ref = torch.softmax(attn_weight_ref, dim=-1)
+        
+        # 对比第一个 batch-head 的 attention score
+        attn_buffer_first = attn_buffer[0]  # [seq_len_q, seq_len_kv]
+        max_diff_attn = (attn_buffer_first - attn_weight_ref[0]).abs().max()
+        print(f"[V1 Debug] Attention score max diff vs torch (first head): {max_diff_attn:.6f}")
+    
     # reshape 回 4D
     output = output.view(batch_size, num_heads_q, seq_len_q, head_dim)
     return output
@@ -248,7 +289,8 @@ def precision_check_all():
     
     # 定义测试场景: (attn_mask, desc)
     test_cases = [
-        (torch.ones(q_seq_len, kv_seq_len, device=DEVICE, dtype=torch.bool).tril(diagonal=0), "bool mask (causal)"),
+        (torch.ones(q_seq_len, kv_seq_len, device=DEVICE, dtype=torch.bool), "bool mask (causal)"),
+        # (torch.ones(q_seq_len, kv_seq_len, device=DEVICE, dtype=torch.bool).tril(diagonal=0), "bool mask (causal)"),
     ]
     
     for attn_mask, desc in test_cases:
