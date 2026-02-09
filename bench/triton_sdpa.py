@@ -41,7 +41,7 @@ def torch_native_sdpa(query, key, value, attn_mask) -> torch.Tensor:
 
 
 # ============================================================================
-# Triton Kernel v1 (TODO: 待实现)
+# Triton Kernel v1
 # ============================================================================
 
 @triton.jit
@@ -109,22 +109,21 @@ def sdpa_kernel_v1(
                     acc += tl.dot(q, tl.trans(k)).to(tl.float32)
 
                 offs_attn = offs_m[:,None]*seq_len_kv + offs_n[None,:]
-                # attn_fuse_mask = tl.load(mask_start+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
+                attn_fuse_mask = tl.load(mask_start+offs_attn, mask=mask_m[:,None]&mask_n[None,:], other=False)
 
                 # acc 是 softmax 输入的 [M, N] 一小块。考虑外部输入的 mask，一起跑 online-softmax
                 acc_scaled = acc * scale_factor
-                # 目前 attn_mask 是全1，所以不需要 mask
                 
-                # 创建 mask：[BLOCK_M, BLOCK_N]
-                full_mask = mask_m[:,None] & mask_n[None,:]
                 # 对越界位置设为 -inf，使其不影响 softmax 统计量
-                acc_masked = tl.where(full_mask, acc_scaled, float('-inf'))
+                acc_masked = tl.where(attn_fuse_mask, acc_scaled, float('-inf'))
 
-                tl.store(attn_start+offs_attn, acc_scaled, mask=full_mask)
+                tl.store(attn_start+offs_attn, acc_masked)
                 
                 block_max = tl.max(acc_masked, axis=-1)
                 new_max = tl.maximum(_max, block_max)
                 _exp_sum = _exp_sum * tl.exp(_max - new_max) + tl.sum(tl.exp(acc_masked - new_max[:, None]), axis=-1) 
+                # triton 是左侧补 1
+                # _exp_sum = _exp_sum * tl.exp(_max - new_max) + tl.sum(tl.exp(acc_masked - new_max), axis=-1) 
                 _max = new_max
 
             for n in range(0, seq_len_kv, BLOCK_N):
@@ -135,14 +134,13 @@ def sdpa_kernel_v1(
                 # 完整的 mask: [BLOCK_M, BLOCK_N]
                 full_mask = mask_m[:,None] & mask_n[None,:]
 
-                attn = tl.load(attn_start+offs_attn, mask=full_mask, other=0.0)
+                attn = tl.load(attn_start+offs_attn, mask=full_mask, other=float('-inf'))
+
                 # 计算 softmax：exp(x - max) / sum_exp
                 # 注意：只有有效位置才计算，越界位置保持为0
                 attn_score = tl.where(full_mask, tl.exp(attn - _max[:, None]) / _exp_sum[:, None], 0.0)
 
                 tl.store(attn_start+offs_attn, attn_score, mask=full_mask)
-                    
-        # pdb.set_trace()
         
         # attn_score @ V
         # [seq_len_q, seq_len_kv] @ [seq_len_kv, head_dim]
@@ -177,7 +175,7 @@ def sdpa_kernel_v1(
 
 def v1(query, key, value, attn_mask):
     """
-    TODO: SDPA v1 实现
+    SDPA v1 实现
     
     输入形状:
         query: (batch_size, num_heads_q, seq_len_q, head_dim)
@@ -231,37 +229,38 @@ def v1(query, key, value, attn_mask):
         BLOCK_D=BLOCK_D,
     )
     
-    # 检查 attention score 精度：每行累加和应该接近 1.0
-    # attn_buffer 形状: [B*H, seq_len_q, seq_len_kv]
-    row_sums = attn_buffer.sum(dim=-1)  # 每行累加和
-    print("row_sums" + str(row_sums))
-    print(f"[V1 Debug] Attention score row sum - mean: {row_sums.mean():.6f}, "
-          f"std: {row_sums.std():.6f}, min: {row_sums.min():.6f}, max: {row_sums.max():.6f}")
-    
-    # 检查与标准 softmax 的差异（理论上每行和应为 1.0）
-    deviation_from_one = (row_sums - 1.0).abs()
-    print(f"[V1 Debug] Deviation from 1.0 - mean: {deviation_from_one.mean():.6f}, "
-          f"max: {deviation_from_one.max():.6f}")
-    
-    # 对比 PyTorch 的 attention score
-    with torch.no_grad():
-        L, S = seq_len_q, seq_len_kv
-        scale_factor = 1.0 / math.sqrt(head_dim)
-        attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
-        attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+    if False:
+        # 检查 attention score 精度：每行累加和应该接近 1.0
+        # attn_buffer 形状: [B*H, seq_len_q, seq_len_kv]
+        row_sums = attn_buffer.sum(dim=-1)  # 每行累加和
+        print("row_sums" + str(row_sums))
+        print(f"[V1 Debug] Attention score row sum - mean: {row_sums.mean():.6f}, "
+            f"std: {row_sums.std():.6f}, min: {row_sums.min():.6f}, max: {row_sums.max():.6f}")
         
-        # 计算参考 attention score (第一个 batch, 第一个 head)
-        q_ref = query_reshaped[0:1]  # [1, seq_len_q, head_dim]
-        k_ref = key_reshaped[0:1]    # [1, seq_len_kv, head_dim]
-        attn_weight_ref = q_ref @ k_ref.transpose(-2, -1) * scale_factor
-        attn_weight_ref += attn_bias
-        attn_weight_ref = torch.softmax(attn_weight_ref, dim=-1)
+        # 检查与标准 softmax 的差异（理论上每行和应为 1.0）
+        deviation_from_one = (row_sums - 1.0).abs()
+        print(f"[V1 Debug] Deviation from 1.0 - mean: {deviation_from_one.mean():.6f}, "
+            f"max: {deviation_from_one.max():.6f}")
         
-        # 对比第一个 batch-head 的 attention score
-        attn_buffer_first = attn_buffer[0]  # [seq_len_q, seq_len_kv]
-        max_diff_attn = (attn_buffer_first - attn_weight_ref[0]).abs().max()
-        print(f"[V1 Debug] Attention score max diff vs torch (first head): {max_diff_attn:.6f}")
-    
+        # 对比 PyTorch 的 attention score
+        with torch.no_grad():
+            L, S = seq_len_q, seq_len_kv
+            scale_factor = 1.0 / math.sqrt(head_dim)
+            attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+            
+            # 计算参考 attention score (第一个 batch, 第一个 head)
+            q_ref = query_reshaped[0:1]  # [1, seq_len_q, head_dim]
+            k_ref = key_reshaped[0:1]    # [1, seq_len_kv, head_dim]
+            attn_weight_ref = q_ref @ k_ref.transpose(-2, -1) * scale_factor
+            attn_weight_ref += attn_bias
+            attn_weight_ref = torch.softmax(attn_weight_ref, dim=-1)
+            
+            # 对比第一个 batch-head 的 attention score
+            attn_buffer_first = attn_buffer[0]  # [seq_len_q, seq_len_kv]
+            max_diff_attn = (attn_buffer_first - attn_weight_ref[0]).abs().max()
+            print(f"[V1 Debug] Attention score max diff vs torch (first head): {max_diff_attn:.6f}")
+        
     # reshape 回 4D
     output = output.view(batch_size, num_heads_q, seq_len_q, head_dim)
     return output
@@ -289,8 +288,8 @@ def precision_check_all():
     
     # 定义测试场景: (attn_mask, desc)
     test_cases = [
-        (torch.ones(q_seq_len, kv_seq_len, device=DEVICE, dtype=torch.bool), "bool mask (causal)"),
-        # (torch.ones(q_seq_len, kv_seq_len, device=DEVICE, dtype=torch.bool).tril(diagonal=0), "bool mask (causal)"),
+        # (torch.ones(q_seq_len, kv_seq_len, device=DEVICE, dtype=torch.bool), "bool mask (causal)"),
+        (torch.ones(q_seq_len, kv_seq_len, device=DEVICE, dtype=torch.bool).tril(diagonal=0), "bool mask (causal)"),
     ]
     
     for attn_mask, desc in test_cases:
@@ -341,9 +340,9 @@ def precision_check_all():
 def benchmark(batch_size, num_heads, seq_len, head_dim, provider):
     """SDPA 性能基准测试"""
     # 生成输入
-    query = torch.randn(batch_size, num_heads, seq_len, head_dim, device=DEVICE, dtype=torch.float16)
-    key = torch.randn(batch_size, num_heads, seq_len, head_dim, device=DEVICE, dtype=torch.float16)
-    value = torch.randn(batch_size, num_heads, seq_len, head_dim, device=DEVICE, dtype=torch.float16)
+    query = torch.randn(batch_size, num_heads, seq_len, head_dim, device=DEVICE, dtype=torch.float32)
+    key = torch.randn(batch_size, num_heads, seq_len, head_dim, device=DEVICE, dtype=torch.float32)
+    value = torch.randn(batch_size, num_heads, seq_len, head_dim, device=DEVICE, dtype=torch.float32)
     
     stream = getattr(torch, DEVICE.type).Stream()
     getattr(torch, DEVICE.type).set_stream(stream)
@@ -355,16 +354,17 @@ def benchmark(batch_size, num_heads, seq_len, head_dim, provider):
     flops = 4 * batch_size * num_heads * seq_len * seq_len * head_dim
     
     # 生成 causal mask
-    attn_mask = torch.ones(seq_len, seq_len, device=DEVICE, dtype=torch.bool)
-    # .tril(diagonal=0)
-    
-    if provider == 'torch':
-        ms = triton.testing.do_bench(lambda: torch_native_sdpa(query, key, value, attn_mask))
-    elif provider == 'v1':
-        try:
+    attn_mask = torch.ones(seq_len, seq_len, device=DEVICE, dtype=torch.bool).tril(diagonal=0)
+    ms = 0
+    try:
+        if provider == 'torch':
+            ms = triton.testing.do_bench(lambda: torch_native_sdpa(query, key, value, attn_mask))
+        elif provider == 'tc':
+            ms = triton.testing.do_bench(lambda: torch_compile_sdpa(query, key, value, attn_mask))
+        elif provider == 'v1':
             ms = triton.testing.do_bench(lambda: v1(query, key, value, attn_mask))
-        except NotImplementedError:
-            return 0  # 未实现时返回 0
+    except NotImplementedError:
+        return 0  # 未实现时返回 0
     
     # 转换为 TFLOPS
     tflops = lambda ms: flops * 1e-12 / (ms * 1e-3)
@@ -380,4 +380,4 @@ if __name__ == "__main__":
     precision_check_all()
     
     print("\nRunning benchmark...")
-    # benchmark.run(save_path=os.path.dirname(__file__), print_data=True)
+    benchmark.run(save_path=os.path.dirname(__file__), print_data=True)
