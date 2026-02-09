@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 from triton.runtime import driver
 import math
-from utils import LaunchParam
+from utils import LaunchParam, calculate_settings
 import pdb
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -38,7 +38,6 @@ def torch_native_sdpa(query, key, value, attn_mask) -> torch.Tensor:
     attn_weight += attn_bias
     attn_weight = torch.softmax(attn_weight, dim=-1)
     return attn_weight @ value
-
 
 # ============================================================================
 # Triton Kernel v3 (FlashAttention with 2D grid parallelization)
@@ -109,30 +108,35 @@ def sdpa_kernel_v3(
             # 加载外部 mask
             offs_mask = offs_m[:,None] * seq_len_kv + offs_n[None, :]
             attn_mask = tl.load(mask_start + offs_mask, mask=mask_m[:,None] & mask_n[None,:], other=False)
-            qk_masked = tl.where(attn_mask, qk_scaled, float('-inf'))
+            
+            # 优化：检查 mask 是否全为 False（如下三角矩阵的右上角区域）
+            # 如果是，则跳过该 block 的计算，避免不必要的 softmax 和 V 加载
+            mask_any = tl.max(attn_mask.to(tl.int32))
+            if mask_any > 0:
+                qk_masked = tl.where(attn_mask, qk_scaled, float('-inf'))
 
-            # ===== Online softmax 更新 =====
-            m_curr = tl.max(qk_masked, axis=1)
-            m_new = tl.maximum(m_prev, m_curr)
-            alpha = tl.exp(m_prev - m_new)
-            p = tl.exp(qk_masked - m_new[:, None])
-            l_curr = tl.sum(p, axis=1)
-            l_new = alpha * l_prev + l_curr
-            
-            # 修正输出累加器
-            acc_o = acc_o * alpha[:, None]
-            
-            # 加载 V 并累加
-            for d in range(0, head_dim, BLOCK_D):
-                offs_d = d + tl.arange(0, BLOCK_D)
-                mask_d = offs_d < head_dim
+                # ===== Online softmax 更新 =====
+                m_curr = tl.max(qk_masked, axis=1)
+                m_new = tl.maximum(m_prev, m_curr)
+                alpha = tl.exp(m_prev - m_new)
+                p = tl.exp(qk_masked - m_new[:, None])
+                l_curr = tl.sum(p, axis=1)
+                l_new = alpha * l_prev + l_curr
                 
-                v_ptrs = v_start + offs_n[:,None] * head_dim + offs_d[None, :]
-                v = tl.load(v_ptrs, mask=mask_n[:,None] & mask_d[None,:], other=0.0)
-                acc_o += tl.dot(p, v)
+                # 修正输出累加器
+                acc_o = acc_o * alpha[:, None]
+                
+                # 加载 V 并累加
+                for d in range(0, head_dim, BLOCK_D):
+                    offs_d = d + tl.arange(0, BLOCK_D)
+                    mask_d = offs_d < head_dim
+                    
+                    v_ptrs = v_start + offs_n[:,None] * head_dim + offs_d[None, :]
+                    v = tl.load(v_ptrs, mask=mask_n[:,None] & mask_d[None,:], other=0.0)
+                    acc_o += tl.dot(p, v)
 
-            m_prev = m_new
-            l_prev = l_new
+                m_prev = m_new
+                l_prev = l_new
 
         # 最终归一化并写回
         acc_o = acc_o / l_prev[:, None]
@@ -166,9 +170,38 @@ def v3(query, key, value, attn_mask):
     
     B = batch_size * num_heads_q
     
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_D = 64
+    # 使用 calculate_settings 计算 BLOCK_D 和 num_warps
+    BLOCK_D, _ = calculate_settings(head_dim)
+    
+    # BLOCK_M 和 BLOCK_N 的选择策略：
+    # 1. 小序列：用较小的 BLOCK 增加并行度
+    # 2. 大序列：用较大的 BLOCK 减少 kernel 启动开销，但要考虑寄存器压力
+    # 3. BLOCK_N 通常 >= BLOCK_M，这样每个 query block 可以重用加载的 KV
+    
+    # 计算可用的并行度
+    total_queries = B * seq_len_q
+    
+    if seq_len_q <= 64:
+        # 小序列：最大化并行度
+        BLOCK_M = 64
+        BLOCK_N = 64
+        num_warps = 4
+    elif seq_len_q <= 512:
+        # 中等序列
+        BLOCK_M = 64
+        BLOCK_N = 128  # 更大的 BLOCK_N 减少 KV 加载次数
+        num_warps = 4
+    else:
+        # 大序列：平衡并行度和效率
+        # 如果总 queries 很多，可以用更大的 BLOCK
+        if total_queries >= 4096:
+            BLOCK_M = 128
+            BLOCK_N = 128
+            num_warps = 8
+        else:
+            BLOCK_M = 64
+            BLOCK_N = 128
+            num_warps = 4
     
     # 2D grid: (batch*heads, num_query_blocks)
     num_m_blocks = triton.cdiv(seq_len_q, BLOCK_M)
@@ -181,6 +214,7 @@ def v3(query, key, value, attn_mask):
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
+        num_warps=num_warps,
     )
     
     output = output.view(batch_size, num_heads_q, seq_len_q, head_dim)
@@ -638,9 +672,9 @@ def precision_check_all():
         x_names=['seq_len'],  # x 轴变量
         x_vals=[128 * i for i in range(2, 64, 4)],  # 序列长度变化范围
         line_arg='provider',  # 不同线条对应不同实现
-        line_vals=['tc', 'v1', 'v2', 'v3'],
-        line_names=["TorchCompile", "Triton-v1", "Triton-v2", "Triton-v3"],
-        styles=[('blue', '-'), ('green', '-'), ('red', '-'), ('orange', '-'), ('purple', '-')],
+        line_vals=['tc', 'v1', 'v3'],
+        line_names=["TorchCompile", "Triton-v1", "Triton-v3"],
+        styles=[('blue', '-'), ('green', '-'), ('red', '-'), ('orange', '-'), ('purple', '-'), ('cyan', '-')],
         ylabel="TFLOPS",  # 注意：SDPA 用 TFLOPS 更合适
         plot_name="sdpa-performance",
         args={'batch_size': 2, 'num_heads': 8, 'head_dim': 64},
